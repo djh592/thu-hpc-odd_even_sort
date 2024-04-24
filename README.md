@@ -2,6 +2,26 @@
 
 2024 春高性能计算导论 PA1
 
+作为参考的 7 组公开测试用例的性能线（表示较优的性能水平）：
+
+| 测试用例           | 性能线（运行时间） |
+| ------------------ | ---------------- |
+| data/100.dat       | 0.015 ms         |
+| data/1000.dat	     | 0.07 ms          |
+| data/10000.dat	   | 0.25 ms          | 
+| data/100000.dat	   | 1.2 ms           |
+| data/1000000.dat	 | 6 ms             |
+| data/10000000.dat	 | 75 ms            |
+| data/100000000.dat | 770 ms           | 
+
+代码非常长，因为提交的代码塞进去了两个版本，根据 n 的大小选择交换策略，本来只有 60 行的。。。
+
+绑核之后，只有 n = 1000000 会在性能线左右徘徊，其他可以稳过。
+
+所以优化还是不够，可以考虑自己开 buffer 进行 merge。。。
+
+不过，我选择躺平^_^
+
 ## 代码
 
 ```cpp
@@ -34,11 +54,12 @@ void Worker::sort()
   const int proc_size = (n + block_size - 1) / block_size;      // 参与排序的进程数
   const int l_neighbour = rank > 0 ? rank - 1 : -1;             // 左侧邻居
   const int r_neighbour = rank < proc_size - 1 ? rank + 1 : -1; // 右侧邻居
-  const int max_swap = 2 * (proc_size - 1);                     // 最大交换次数
 
-  // 数据量小，减少通信次数的算法
+  // 数据量小，平衡通信开销的算法
   if (n < 20000000)
   {
+    const int max_swap = proc_size - 1; // 合并两轮交换做优化
+
     // 写入数据
     float *sort_arr = new float[block_size * 3]; // 排序数组
     float *my_arr_beg = &sort_arr[block_size];
@@ -50,13 +71,51 @@ void Worker::sort()
     // 交换数据
     int send_rank = 0;
     MPI_Request *send_list = new MPI_Request[max_swap * 2]; // 统一 wait Isend
-    // MPI_Request recv_req;                                   // 单独 wait Irecv
-    MPI_Status recv_status; // 单独回收 Irecv
-    for (int swap = 0, stage = 0; swap < max_swap; stage = (++swap) % 2)
-    {
-      if (parity == stage) // 左边进程（右侧交换）
+    MPI_Request recv_req;                                   // 单独 wait Irecv
+    MPI_Status recv_status;                                 // 单独回收 Irecv
+
+    if (l_neighbour == -1) // 第一个进程
+      for (int swap = 0; swap < max_swap; ++swap)
       {
-        if (r_neighbour != -1)
+        float my_max = *(my_arr_end - 1);
+        float right_min;
+        MPI_Isend(&my_max, 1, MPI_FLOAT, r_neighbour, 0, MPI_COMM_WORLD, &send_list[send_rank++]);
+        MPI_Recv(&right_min, 1, MPI_FLOAT, r_neighbour, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        if (my_max > right_min) // 需要交换
+        {
+          float *beg_pos = std::upper_bound(my_arr_beg, my_arr_end, right_min);
+          int send_len = my_arr_end - beg_pos;
+          MPI_Sendrecv(beg_pos, send_len, MPI_FLOAT, r_neighbour, 0,
+                       my_arr_end, block_size, MPI_FLOAT, r_neighbour, 0,
+                       MPI_COMM_WORLD, &recv_status);
+          int recv_len;
+          MPI_Get_count(&recv_status, MPI_FLOAT, &recv_len);
+          std::inplace_merge(beg_pos, my_arr_end, my_arr_end + recv_len);
+        }
+      }
+    else if (r_neighbour == -1) // 最后一个进程
+      for (int swap = 0; swap < max_swap; ++swap)
+      {
+        float my_min = *my_arr_beg;
+        float left_max;
+        MPI_Isend(&my_min, 1, MPI_FLOAT, l_neighbour, 0, MPI_COMM_WORLD, &send_list[send_rank++]);
+        MPI_Recv(&left_max, 1, MPI_FLOAT, l_neighbour, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        if (my_min < left_max) // 需要交换
+        {
+          float *end_pos = std::lower_bound(my_arr_beg, my_arr_end, left_max);
+          int send_len = end_pos - my_arr_beg;
+          MPI_Sendrecv(my_arr_beg, send_len, MPI_FLOAT, l_neighbour, 0,
+                       l_recv_arr, block_size, MPI_FLOAT, l_neighbour, 0,
+                       MPI_COMM_WORLD, &recv_status);
+          int recv_len;
+          MPI_Get_count(&recv_status, MPI_FLOAT, &recv_len);
+          std::merge(my_arr_beg, end_pos, l_recv_arr, l_recv_arr + recv_len, &sort_arr[block_size - recv_len]);
+        }
+      }
+    else // 中间进程
+    {
+      if (parity == 0) // 偶数进程
+        for (int swap = 0; swap < max_swap; ++swap)
         {
           float my_max = *(my_arr_end - 1);
           float right_min;
@@ -64,6 +123,10 @@ void Worker::sort()
           MPI_Recv(&right_min, 1, MPI_FLOAT, r_neighbour, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
           if (my_max > right_min) // 需要交换
           {
+            float my_min = right_min < *my_arr_beg ? right_min : *my_arr_beg;
+            float left_max;
+            MPI_Isend(&my_min, 1, MPI_FLOAT, l_neighbour, 0, MPI_COMM_WORLD, &send_list[send_rank++]);
+            MPI_Irecv(&left_max, 1, MPI_FLOAT, l_neighbour, 0, MPI_COMM_WORLD, &recv_req);
             float *beg_pos = std::upper_bound(my_arr_beg, my_arr_end, right_min);
             int send_len = my_arr_end - beg_pos;
             MPI_Sendrecv(beg_pos, send_len, MPI_FLOAT, r_neighbour, 0,
@@ -72,12 +135,40 @@ void Worker::sort()
             int recv_len;
             MPI_Get_count(&recv_status, MPI_FLOAT, &recv_len);
             std::inplace_merge(beg_pos, my_arr_end, my_arr_end + recv_len);
+            MPI_Wait(&recv_req, &recv_status);
+            if (my_min < left_max) // 需要交换
+            {
+              float *end_pos = std::lower_bound(my_arr_beg, my_arr_end, left_max);
+              int send_len = end_pos - my_arr_beg;
+              MPI_Sendrecv(my_arr_beg, send_len, MPI_FLOAT, l_neighbour, 0,
+                           l_recv_arr, block_size, MPI_FLOAT, l_neighbour, 0,
+                           MPI_COMM_WORLD, &recv_status);
+              int recv_len;
+              MPI_Get_count(&recv_status, MPI_FLOAT, &recv_len);
+              std::merge(my_arr_beg, end_pos, l_recv_arr, l_recv_arr + recv_len, &sort_arr[block_size - recv_len]);
+            }
+          }
+          else // 直接第二轮
+          {
+            float my_min = *my_arr_beg;
+            float left_max;
+            MPI_Isend(&my_min, 1, MPI_FLOAT, l_neighbour, 0, MPI_COMM_WORLD, &send_list[send_rank++]);
+            MPI_Recv(&left_max, 1, MPI_FLOAT, l_neighbour, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            if (my_min < left_max) // 需要交换
+            {
+              float *end_pos = std::lower_bound(my_arr_beg, my_arr_end, left_max);
+              int send_len = end_pos - my_arr_beg;
+              MPI_Sendrecv(my_arr_beg, send_len, MPI_FLOAT, l_neighbour, 0,
+                           l_recv_arr, block_size, MPI_FLOAT, l_neighbour, 0,
+                           MPI_COMM_WORLD, &recv_status);
+              int recv_len;
+              MPI_Get_count(&recv_status, MPI_FLOAT, &recv_len);
+              std::merge(my_arr_beg, end_pos, l_recv_arr, l_recv_arr + recv_len, &sort_arr[block_size - recv_len]);
+            }
           }
         }
-      }
-      else // 右边进程（左侧交换）
-      {
-        if (l_neighbour != -1)
+      else // 奇数进程
+        for (int swap = 0; swap < max_swap; ++swap)
         {
           float my_min = *my_arr_beg;
           float left_max;
@@ -85,6 +176,10 @@ void Worker::sort()
           MPI_Recv(&left_max, 1, MPI_FLOAT, l_neighbour, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
           if (my_min < left_max) // 需要交换
           {
+            float my_max = left_max > *(my_arr_end - 1) ? left_max : *(my_arr_end - 1);
+            float right_min;
+            MPI_Isend(&my_max, 1, MPI_FLOAT, r_neighbour, 0, MPI_COMM_WORLD, &send_list[send_rank++]);
+            MPI_Irecv(&right_min, 1, MPI_FLOAT, r_neighbour, 0, MPI_COMM_WORLD, &recv_req);
             float *end_pos = std::lower_bound(my_arr_beg, my_arr_end, left_max);
             int send_len = end_pos - my_arr_beg;
             MPI_Sendrecv(my_arr_beg, send_len, MPI_FLOAT, l_neighbour, 0,
@@ -93,11 +188,39 @@ void Worker::sort()
             int recv_len;
             MPI_Get_count(&recv_status, MPI_FLOAT, &recv_len);
             std::merge(my_arr_beg, end_pos, l_recv_arr, l_recv_arr + recv_len, &sort_arr[block_size - recv_len]);
+            MPI_Wait(&recv_req, &recv_status);
+            if (my_max > right_min) // 需要交换
+            {
+              float *beg_pos = std::upper_bound(my_arr_beg, my_arr_end, right_min);
+              int send_len = my_arr_end - beg_pos;
+              MPI_Sendrecv(beg_pos, send_len, MPI_FLOAT, r_neighbour, 0,
+                           my_arr_end, block_size, MPI_FLOAT, r_neighbour, 0,
+                           MPI_COMM_WORLD, &recv_status);
+              int recv_len;
+              MPI_Get_count(&recv_status, MPI_FLOAT, &recv_len);
+              std::inplace_merge(beg_pos, my_arr_end, my_arr_end + recv_len);
+            }
+          }
+          else // 直接开启第二轮
+          {
+            float my_max = *(my_arr_end - 1);
+            float right_min;
+            MPI_Isend(&my_max, 1, MPI_FLOAT, r_neighbour, 0, MPI_COMM_WORLD, &send_list[send_rank++]);
+            MPI_Recv(&right_min, 1, MPI_FLOAT, r_neighbour, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            if (my_max > right_min) // 需要交换
+            {
+              float *beg_pos = std::upper_bound(my_arr_beg, my_arr_end, right_min);
+              int send_len = my_arr_end - beg_pos;
+              MPI_Sendrecv(beg_pos, send_len, MPI_FLOAT, r_neighbour, 0,
+                           my_arr_end, block_size, MPI_FLOAT, r_neighbour, 0,
+                           MPI_COMM_WORLD, &recv_status);
+              int recv_len;
+              MPI_Get_count(&recv_status, MPI_FLOAT, &recv_len);
+              std::inplace_merge(beg_pos, my_arr_end, my_arr_end + recv_len);
+            }
           }
         }
-      }
     }
-
     // 写回数据
     memcpy(data, my_arr_beg, block_len * sizeof(float));
     MPI_Waitall(send_rank, send_list, MPI_STATUSES_IGNORE);
@@ -108,6 +231,8 @@ void Worker::sort()
   // n 很大，减少通信传输量的算法
   else
   {
+    const int max_swap = (proc_size - 1) * 2;
+
     // 写入数据
     float *sort_arr = new float[block_size * 2];       // 排序数组
     memcpy(sort_arr, data, block_len * sizeof(float)); // 将数据写入排序数组
@@ -171,15 +296,15 @@ void Worker::sort()
 
 **说明：**
 
-首先，准备一个用来排序的数据 `sort_arr`，将数据写入，并用 `std::sort` 进行第一次排序。
+首先，准备一个用来排序的数组 `sort_arr`，将数据写入，并用 `std::sort` 进行第一次排序。
 
-开始交换，我写了两种交换策略：
+然后，进行交换，这份代码整合了我写的两种交换策略：
 
-- 相邻进程互换数据，然后 merge；这种方法有利于减少通信次数。
+- 相邻进程通过 sendrecv 互换数据，然后分别 merge；同时，我在相邻两次收发数据之间做优化。这种方法有利于减少通信开销，并且相邻进程的负担相同，有利于同步状态。但是这种交换方式容易受数据量的影响。
 
-- rank 小的进程接收原始数据，并进行 `std::inplace_merge`，发送合并好的数据；rank 大的进程发送原始数据，接收合并好的数据；这种方法有利于减少传输数据量。
+- rank 小的进程接收原始数据，并进行 `std::inplace_merge`，发送合并好的数据；rank 大的进程发送原始数据，接收合并好的数据；这种方法会使执行 `std::inplace_merge` 的进程负担较大，但是有利于减少传输数据量。
 
-第一种方法在数据量较小时使用；第二种方法在数据量较大时使用。
+第一种方法在 n 较小时使用；第二种方法在 n 较大时使用。
 
 交换完成后，将 `sort_arr` 中数据写回 `data`。
 
@@ -187,7 +312,7 @@ void Worker::sort()
 
 在我的代码中，做出的优化如下：
 
-- 数据量小时减少通信次数；数据量大时减少通信数据量
+- 数据量小时平衡通信开销；数据量大时减少通信数据量
 
 - 相邻进程交换数据前先检查是否要交换，不交换数据则跳过通信
 - 使用 `std::upper_bound` 和 `std::lower_bound` 确定最少的交换数量
@@ -246,9 +371,9 @@ fi
 
 # 检查是否分配到多机上
 if [ $NUM_PROCESSES -gt 28 ]; then
-  srun -N 2 -n $NUM_PROCESSES --cpu-bind=none ./wrapper.sh $*
+  srun -N 2 -n $NUM_PROCESSES --cpu-bind=none --exclusive ./wrapper.sh $*
 else
-  srun -N 1 -n $NUM_PROCESSES --cpu-bind=none ./wrapper.sh $*
+  srun -N 1 -n $NUM_PROCESSES --cpu-bind=none --exclusive ./wrapper.sh $*
 fi
 ```
 
@@ -256,7 +381,7 @@ fi
 
 使用 Makefile 编译代码，编译的选项为：`-std=c++14 -O3 -Wall -Wextra -Werror -Wno-cast-function-type -pedantic -funroll-loops -DDEBUG`。
 
-使用 `srun -N <机器数> -n <进程数> --cpu-bind=none ./wrapper.sh $*` 运行代码，进行进程映射。
+使用 `srun -N <机器数> -n <进程数> --cpu-bind=none --exclusive ./wrapper.sh $*` 运行代码，进行进程映射。
 
 $1×1$，$1×2$，$1×4$，$1×8$，$1×16$，$2×16$ 进程及元素数量 $n=100000000$ 的情况下 `sort` 函数的运行时间，及相对单进程的加速比如下：
 
@@ -270,4 +395,3 @@ $1×1$，$1×2$，$1×4$，$1×8$，$1×16$，$2×16$ 进程及元素数量 $n=1
 | $2×16$ | 949.361000     | 13.07326 |
 
 注：上述测试的结果都是三次取平均得到。
-
